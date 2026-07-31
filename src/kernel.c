@@ -31,7 +31,7 @@
 #include "include/gfx/vbe.h"
 #include "pci/pci.h"
 #include "block/ata/ata.h"
-
+#include "mm/pmm.h"
 
 char early_init = 1;
 // goes to 0 0 so that the scrolling of the panic message doesn't take forever

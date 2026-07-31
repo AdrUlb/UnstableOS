@@ -1,5 +1,6 @@
 #ifndef USE_LEGACY_PFA
 
+#include "mm/pmm.h"
 #include "mm/kernel_memory.h"
 
 #include <stdbool.h>
@@ -13,20 +14,19 @@
 
 // Sentinel value, indicates that this is a tail page
 // The refcount is instead the page number of the allocation's head page
-#define PMM_ORDER_TAIL (PMM_ORDER_MAX + 1)
+#define ORDER_TAIL (PMM_ORDER_MAX + 1)
 
-// Sentinel value, indicates that this page is free
-// The refcount is instead the page number of the next free page in the free list
-#define PMM_ORDER_FREE (PMM_ORDER_MAX + 2)
-
-typedef struct
+typedef struct __attribute__((packed))
 {
 	// The reference count of this page
-	// or the page number of the allocation's head page if order == PMM_ORDER_TAIL
-	// or the page number of the next free page if order == PMM_ORDER_FREE
-	uint32_t refcount : 24;
-	uint32_t order : 8;
-} pmm_page_info_t;
+	uint32_t refcount : 20;
+
+	uint32_t free_next : 20;
+	uint32_t free_prev : 20;
+
+	// The order of this page, if refcount == 0, the order of the freelist this page is part of
+	uint32_t order : 4;
+} page_info_t;
 
 #define PAGE_ALIGN_UP(address) ((address + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1))
 #define PAGE_ALIGN_DOWN(address) (address & ~(PAGE_SIZE - 1))
@@ -39,25 +39,39 @@ typedef struct
 {
 	size_t start;
 	size_t end;
-} pre_vmm_range_t;
+} range_t;
 
 // This structure takes up exactly one page and is freed into the PMM after the VMM is up and running
-#define PRE_VMM_RANGES_MAX ((PAGE_SIZE - sizeof(size_t)) / sizeof(pre_vmm_range_t))
+#define PRE_VMM_RANGES_MAX ((PAGE_SIZE - sizeof(size_t)) / sizeof(range_t))
 
 static struct __attribute__((packed, aligned(PAGE_SIZE)))
 {
-	pre_vmm_range_t ranges[PRE_VMM_RANGES_MAX];
+	range_t ranges[PRE_VMM_RANGES_MAX];
 	size_t ranges_count;
 } pre_vmm_info;
 
+static bool pre_vmm;
+
+size_t usable_pages_end, usable_page_count, free_page_count;
+
 // We can safely use 0 as the end-of-freelist sentinel because page 0 is not allowed to be marked as free
 static size_t freelists[PMM_ORDER_MAX + 1] = { 0 };
+static page_info_t* pages = (page_info_t*)PAGES_START;
 
-static pmm_page_info_t* pages = (pmm_page_info_t*)PAGES_START;
+#define PAGE_INFO(page_num) pages[page_num]
 
-static bool early;
+#define FREELIST_INSERT(block, order) ({ \
+		PAGE_INFO(block).free_prev = 0; \
+		PAGE_INFO(block).free_next = freelists[order]; \
+		if (freelists[order]) PAGE_INFO(freelists[order]).free_prev = block; \
+		freelists[order] = block; \
+	})
+#define FREELIST_REMOVE(block) ({ \
+		if (PAGE_INFO(block).free_prev) PAGE_INFO(PAGE_INFO(block).free_prev).free_next = PAGE_INFO(block).free_next; \
+		if (PAGE_INFO(block).free_next) PAGE_INFO(PAGE_INFO(block).free_next).free_prev = PAGE_INFO(block).free_prev; \
+	})
 
-static void pre_vmm_insert_range(const size_t start, const size_t end, pre_vmm_range_t* ranges, size_t* ranges_count, const size_t ranges_max)
+static void pre_vmm_insert_range(const size_t start, const size_t end, range_t* ranges, size_t* ranges_count, const size_t ranges_max)
 {
 	if (start >= end)
 		return;
@@ -116,7 +130,7 @@ static void pre_vmm_insert_range(const size_t start, const size_t end, pre_vmm_r
 
 static void pre_vmm_insert_range_checked(size_t start, const size_t end, const multiboot_info_t* multiboot_info)
 {
-	pre_vmm_range_t reserved[PRE_VMM_RESERVED_RANGES_MAX]; // Let's hope 32 is enough here >_<
+	range_t reserved[PRE_VMM_RESERVED_RANGES_MAX]; // Let's hope 32 is enough here >_<
 	size_t reserved_count = 0;
 
 	// Add the kernel to the list of ranges to avoid
@@ -214,9 +228,74 @@ static void pre_vmm_insert_range_checked(size_t start, const size_t end, const m
 		pre_vmm_insert_range(start, end, pre_vmm_info.ranges, &pre_vmm_info.ranges_count, PRE_VMM_RANGES_MAX);
 }
 
+#define BLOCK_BUDDY(block, order) ((block) ^ (1ULL << (order)))
+
+static void insert_free_block(size_t block, size_t order)
+{
+	// Merge blocks until max order is reached
+	while (order < PMM_ORDER_MAX)
+	{
+		const size_t buddy = BLOCK_BUDDY(block, order);
+		if (buddy >= usable_pages_end)
+			break;
+
+		const page_info_t* buddy_info = &PAGE_INFO(buddy);
+
+		// If the buddy is not free we can stop merging
+		if (buddy_info->refcount != 0 || buddy_info->order != order)
+			break;
+
+		FREELIST_REMOVE(buddy);
+
+		// Get the merged block (lower of block and buddy)
+		if (buddy < block)
+			block = buddy;
+
+		order++;
+	}
+
+	// Insert the new block
+	FREELIST_INSERT(block, order);
+
+	const size_t page_count = 1ULL << order;
+
+	// Mark the entire block as free with the proper order
+	for (size_t i = 0; i < page_count; i++)
+		pages[block + i] = (page_info_t) { .refcount = 0, .order = order };
+}
+
+static void insert_free_range(range_t range)
+{
+	while (range.start < range.end)
+	{
+		const size_t length = range.end - range.start;
+
+		// Identify the highest order this range fits into
+		size_t order = 0;
+		while (order < PMM_ORDER_MAX)
+		{
+			const size_t next_order = order + 1;
+
+			// Abort if the range's start is not correctly aligned for this order
+			if ((size_t)__builtin_ctz(range.start) < next_order)
+				break;
+
+			// Abort if this order's block length exceeds the number of blocks remaining in the range
+			const size_t next_length = 1ULL << next_order;
+			if (next_length > length)
+				break;
+
+			order = next_order;
+		}
+
+		insert_free_block(range.start, order);
+		range.start += 1ULL << order;
+	}
+}
+
 void pmm_init_pre_vmm(const multiboot_info_t* multiboot_info)
 {
-	early = true;
+	pre_vmm = true;
 	pre_vmm_info.ranges_count = 0;
 
 	const volatile multiboot_memory_map_t* entry;
@@ -248,18 +327,40 @@ void pmm_init_pre_vmm(const multiboot_info_t* multiboot_info)
 
 		pre_vmm_insert_range_checked(start_page, end_page, multiboot_info);
 	}
+
+	for (size_t i = 0; i < pre_vmm_info.ranges_count; i++)
+	{
+		const range_t* range = pre_vmm_info.ranges + i;
+
+		if (range->end > usable_pages_end)
+			usable_pages_end = range->end;
+
+		usable_page_count += range->end - range->start;
+	}
+
+	free_page_count = usable_page_count;
 }
 
 void pmm_init_post_vmm()
 {
-	// TODO
+	kassert(pre_vmm);
 
-	/*
-	for (uintptr_t virt = PMM_PAGES_START; virt < PMM_PAGES_END; virt += PAGE_SIZE)
-	{
-		paging_map_phys_addr(, (void*)virt, PTE_PDE_PAGE_WRITABLE);
-	}
-	*/
+	const size_t pages_end = PAGES_START + usable_pages_end * sizeof(page_info_t);
+	kassert(pages_end <= PAGES_END);
+
+	// Map the page info structure into the address space
+	for (uintptr_t virt_addr = PAGES_START; virt_addr < pages_end; virt_addr += PAGE_SIZE)
+		paging_map_phys_addr((void*)(pmm_alloc(0) * PAGE_SIZE), (void*)virt_addr, PTE_PDE_PAGE_WRITABLE);
+
+	// Initially mark all pages as used
+	for (size_t i = 0; i < usable_pages_end; i++)
+		pages[i] = (page_info_t) { .order = 0, .refcount = 1 };
+
+	// Mark available ranges as free
+	for (size_t i = 0; i < pre_vmm_info.ranges_count; i++)
+		insert_free_range(pre_vmm_info.ranges[i]);
+
+	pre_vmm = false;
 }
 
 static inline __attribute__((always_inline)) size_t pmm_pre_vmm_alloc()
@@ -267,20 +368,21 @@ static inline __attribute__((always_inline)) size_t pmm_pre_vmm_alloc()
 	while (true)
 	{
 		kassert(pre_vmm_info.ranges_count > 0);
-		pre_vmm_range_t* range = pre_vmm_info.ranges + (pre_vmm_info.ranges_count - 1);
+		range_t* range = pre_vmm_info.ranges + (pre_vmm_info.ranges_count - 1);
 		if (range->start >= range->end)
 		{
 			pre_vmm_info.ranges_count--;
 			continue;
 		}
 
+		free_page_count--;
 		return range->start++;
 	}
 }
 
 size_t pmm_alloc(const size_t order)
 {
-	if (early)
+	if (pre_vmm)
 	{
 		kassert(order == 0);
 		return pmm_pre_vmm_alloc();
@@ -292,28 +394,31 @@ size_t pmm_alloc(const size_t order)
 
 void pmm_free(const size_t page_num)
 {
-	//kassert(!early);
+	kassert(!pre_vmm);
 
 	// TODO
 }
 
 void pmm_retain(const size_t page_num)
 {
-	//kassert(!early);
+	kassert(!pre_vmm);
 
 	// TODO
 }
 
+size_t pmm_get_usable_pages_end()
+{
+	return usable_pages_end;
+}
+
 size_t pmm_get_usable_page_count()
 {
-	// TODO: actually return the number of usable pages, claim 16 MiB of usable memory for now
-	return 16 * 1024 * 1024 / 4096;
+	return usable_page_count;
 }
 
 size_t pmm_get_free_page_count()
 {
-	// TODO: actually return the number of usable pages, claim 16 MiB of free memory for now
-	return 16 * 1024 * 1024 / 4096;
+	return free_page_count;
 }
 
 // Satisfy the silly old interface
