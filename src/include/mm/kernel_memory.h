@@ -1,8 +1,9 @@
 #ifndef KERNEL_MEMORY_H
 #define KERNEL_MEMORY_H
 
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <bits/limits_local.h>
 #include "../multiboot.h"
 
 
@@ -60,7 +61,19 @@ extern spinlock_t address_spaces_lock;
 
 #define IDENT_MAPPING_MAX_ADDR (10*PAGE_TABLE_ENTRIES*PAGE_SIZE_NO_PAE) // 40MB, for initrd
 
+#ifndef USE_LEGACY_PFA
+void pmm_init_pre_vmm(const multiboot_info_t* multiboot_info);
+void pmm_init_post_vmm();
+size_t pmm_alloc(size_t order);
+void pmm_free(size_t page_num);
+void pmm_retain(size_t page_num);
+size_t pmm_get_usable_page_count();
+size_t pmm_get_free_page_count();
+#define pmm_size_to_order(size) ({ kassert(size != 0); __builtin_ctz(size / PAGE_SIZE); })
+#else
 void * page_frame_alloc_init(multiboot_info_t* mbd, void * free_space_start_page); // returns pointer to end of frame table
+#endif
+
 unsigned long pf_get_free_memory();
 void * pfalloc(); // page frame last_access, returns the amount of free space left after physical page housekeeping
 void * pfalloc_1M(); // gets a 1M contiguous memory region, for dma and such

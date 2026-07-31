@@ -36,7 +36,7 @@ include utils/Include.mk
 KERNEL_CFLAGS := $(CFLAGS) 	-ffreestanding -nostdlib -nodefaultlibs \
 	-nostartfiles -std=gnu99 -Isrc/include $(LIBC_INCLUDES) \
 	-Wall -Wno-unknown-pragmas -fno-strict-aliasing -fstack-protector -march=i486 \
-	-MMD -MP
+	-MMD -MP #-DUSE_LEGACY_PFA
 
 KERNEL_LDFLAGS := -T src/linker.ld $(LIBC_LIB) -lgcc
 
