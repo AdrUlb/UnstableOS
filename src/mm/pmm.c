@@ -9,6 +9,8 @@
 #include "kernel.h"
 #include "multiboot.h"
 
+#define LOWEST_PAGE (PAGE_ALIGN_UP(LOWEST_PHYS_ADDR_ALLOWABLE) / PAGE_SIZE)
+
 // Maximum allocation order: 2^10 = 1024 pages = 4 MiB
 #define PMM_ORDER_MAX 10
 
@@ -19,13 +21,13 @@
 typedef struct __attribute__((packed))
 {
 	// The reference count of this page
-	uint32_t refcount : 20;
+	uint64_t refcount : 20;
 
-	uint32_t free_next : 20;
-	uint32_t free_prev : 20;
+	uint64_t free_next : 20;
+	uint64_t free_prev : 20;
 
 	// The order of this page, if refcount == 0, the order of the freelist this page is part of
-	uint32_t order : 4;
+	uint64_t order : 4;
 } page_info_t;
 
 #define PAGE_ALIGN_UP(address) ((address + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1))
@@ -52,11 +54,13 @@ static struct __attribute__((packed, aligned(PAGE_SIZE)))
 
 static bool pre_vmm;
 
-size_t usable_pages_end, usable_page_count, free_page_count;
+static size_t usable_pages_end, usable_page_count, free_page_count;
 
 // We can safely use 0 as the end-of-freelist sentinel because page 0 is not allowed to be marked as free
 static size_t freelists[PMM_ORDER_MAX + 1] = { 0 };
 static page_info_t* pages = (page_info_t*)PAGES_START;
+
+static spinlock_t lock = { 0 };
 
 #define PAGE_INFO(page_num) pages[page_num]
 
@@ -68,6 +72,7 @@ static page_info_t* pages = (page_info_t*)PAGES_START;
 	})
 #define FREELIST_REMOVE(block) ({ \
 		if (PAGE_INFO(block).free_prev) PAGE_INFO(PAGE_INFO(block).free_prev).free_next = PAGE_INFO(block).free_next; \
+		else freelists[PAGE_INFO(block).order] = PAGE_INFO(block).free_next; \
 		if (PAGE_INFO(block).free_next) PAGE_INFO(PAGE_INFO(block).free_next).free_prev = PAGE_INFO(block).free_prev; \
 	})
 
@@ -86,8 +91,7 @@ static void pre_vmm_insert_range(const size_t start, const size_t end, range_t* 
 	// Are we appending to the end *or* NOT merging?
 	if (i == *ranges_count || ranges[i].start > end)
 	{
-		if (*ranges_count >= ranges_max)
-			return;
+		kassert(*ranges_count < ranges_max);
 
 		for (size_t j = *ranges_count; j > i; j--) // Shift all ranges over to make room for the new one
 			ranges[j] = ranges[j - 1];
@@ -130,6 +134,12 @@ static void pre_vmm_insert_range(const size_t start, const size_t end, range_t* 
 
 static void pre_vmm_insert_range_checked(size_t start, const size_t end, const multiboot_info_t* multiboot_info)
 {
+	if (start < LOWEST_PAGE)
+		start = LOWEST_PAGE;
+
+	if (start >= end) // The range did not contain any whole pages
+		return;
+
 	range_t reserved[PRE_VMM_RESERVED_RANGES_MAX]; // Let's hope 32 is enough here >_<
 	size_t reserved_count = 0;
 
@@ -261,7 +271,10 @@ static void insert_free_block(size_t block, size_t order)
 
 	// Mark the entire block as free with the proper order
 	for (size_t i = 0; i < page_count; i++)
-		pages[block + i] = (page_info_t) { .refcount = 0, .order = order };
+	{
+		pages[block + i].refcount = 0;
+		pages[block + i].order = order;
+	}
 }
 
 static void insert_free_range(range_t range)
@@ -277,7 +290,7 @@ static void insert_free_range(range_t range)
 			const size_t next_order = order + 1;
 
 			// Abort if the range's start is not correctly aligned for this order
-			if ((size_t)__builtin_ctz(range.start) < next_order)
+			if ((size_t)(range.start == 0 ? 0 : __builtin_ctz(range.start)) < next_order)
 				break;
 
 			// Abort if this order's block length exceeds the number of blocks remaining in the range
@@ -319,12 +332,6 @@ void pmm_init_pre_vmm(const multiboot_info_t* multiboot_info)
 		if (end_page > UINT32_MAX / PAGE_SIZE + 1)
 			end_page = UINT32_MAX / PAGE_SIZE + 1;
 
-		if (start_page == 0)
-			start_page = 1;
-
-		if (start_page >= end_page) // The range did not contain any whole pages
-			continue;
-
 		pre_vmm_insert_range_checked(start_page, end_page, multiboot_info);
 	}
 
@@ -352,9 +359,15 @@ void pmm_init_post_vmm()
 	for (uintptr_t virt_addr = PAGES_START; virt_addr < pages_end; virt_addr += PAGE_SIZE)
 		paging_map_phys_addr((void*)(pmm_alloc(0) * PAGE_SIZE), (void*)virt_addr, PTE_PDE_PAGE_WRITABLE);
 
-	// Initially mark all pages as used
+	// Initialize page info
 	for (size_t i = 0; i < usable_pages_end; i++)
-		pages[i] = (page_info_t) { .order = 0, .refcount = 1 };
+	{
+		pages[i] = (page_info_t) {
+			// All pages are marked used initially
+			.order = 0,
+			.refcount = 1
+		};
+	}
 
 	// Mark available ranges as free
 	for (size_t i = 0; i < pre_vmm_info.ranges_count; i++)
@@ -388,22 +401,113 @@ size_t pmm_alloc(const size_t order)
 		return pmm_pre_vmm_alloc();
 	}
 
-	// TODO
-	kassert(false);
+	kassert(order <= PMM_ORDER_MAX);
+
+	spinlock_acquire(&lock);
+
+	// Find the next order >= 'order' that has available blocks
+	size_t block_order = order;
+	while (block_order <= PMM_ORDER_MAX && !freelists[block_order])
+		block_order++;
+
+	// Out of memory
+	if (block_order > PMM_ORDER_MAX)
+	{
+		spinlock_release(&lock);
+		return 0;
+	}
+
+	// Found a block!
+	const size_t block = freelists[block_order];
+	FREELIST_REMOVE(block);
+
+	// Split up the block!
+	while (block_order > order)
+	{
+		// We want to turn a block of order N into two blocks of order N-1
+		block_order--;
+
+		// Figure out how many pages a block in this order has
+		const size_t order_pages = 1ULL << block_order;
+
+		// Get the block's buddy in the new order
+		const size_t buddy = block + (1ULL << block_order);
+
+		// Set the block's pages' orders
+		for (size_t i = 0; i < order_pages; i++)
+		{
+			kassert(pages[buddy + i].refcount == 0);
+			pages[buddy + i].order = block_order;
+		}
+
+		// Insert into the freelist!
+		FREELIST_INSERT(buddy, block_order);
+	}
+
+	pages[block].refcount = 1;
+	pages[block].order = order;
+
+	const size_t order_pages = 1ULL << order;
+	for (size_t i = 1; i < order_pages; i++)
+	{
+		pages[block + i].order = ORDER_TAIL;
+		pages[block + i].refcount = block;
+	}
+
+	free_page_count -= order_pages;
+
+	spinlock_release(&lock);
+
+	return block;
 }
 
 void pmm_free(const size_t page_num)
 {
 	kassert(!pre_vmm);
 
-	// TODO
+	// NULL free => no-op
+	if (page_num == 0)
+		return;
+
+	page_info_t* info = &PAGE_INFO(page_num);
+
+	kassert(page_num < usable_pages_end); // Page out of bounds!
+
+	spinlock_acquire(&lock);
+
+	kassert(info->refcount != 0); // Page not allocated!
+	kassert(info->order != ORDER_TAIL); // Page not head!
+	info->refcount--;
+
+	if (info->refcount == 0)
+	{
+		const size_t order = info->order;
+		free_page_count += 1ULL << order;
+		insert_free_block(page_num, order);
+	}
+
+	spinlock_release(&lock);
 }
 
 void pmm_retain(const size_t page_num)
 {
 	kassert(!pre_vmm);
 
-	// TODO
+	// NULL free => no-op
+	if (page_num == 0)
+		return;
+
+	page_info_t* info = &PAGE_INFO(page_num);
+
+	kassert(page_num < usable_pages_end); // Page out of bounds!
+
+	spinlock_acquire(&lock);
+
+	kassert(info->refcount != 0); // Page not allocated!
+	kassert(info->order != ORDER_TAIL); // Page not head!
+	info->refcount++;
+
+	spinlock_release(&lock);
 }
 
 size_t pmm_get_usable_pages_end()
@@ -421,7 +525,7 @@ size_t pmm_get_free_page_count()
 	return free_page_count;
 }
 
-// Satisfy the silly old interface
+// Satisfy the old interface
 
 unsigned long pf_get_free_memory()
 {

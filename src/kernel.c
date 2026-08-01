@@ -391,7 +391,7 @@ void kernel_entry(multiboot_info_t* mbd, unsigned int magic) {
             } else total_usable += mmmt->len;
         }
     }
-    if (total_usable < 1<<19) panic("At least 512K of usable memory is required for basic kernel functionality!\n");
+    //if (total_usable < 1<<19) panic("At least 512K of usable memory is required for basic kernel functionality!\n");
 #ifndef USE_LEGACY_PFA
 
 	// Initialize physical memory management for the pre-vmm environment
